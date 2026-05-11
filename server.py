@@ -5,19 +5,18 @@ import threading
 from datetime import datetime, timezone
 from typing import Any
 
-from dotenv import load_dotenv
 import httpx
+from dotenv import load_dotenv
 from google import genai
 from google.genai import types as genai_types
 from supabase import Client, create_client
 
 from mcp import types as mcp_types
-from mcp.server import Server, ServerRequestContext
-import mcp.server.stdio
+from mcp.server import Server
+from mcp.server.stdio import stdio_server
 
 # Load environment variables from .env file (if present)
 load_dotenv()
-
 
 # -----------------------------
 # Configuration
@@ -45,13 +44,11 @@ HOST = os.getenv("HOST", "0.0.0.0")
 # - stdio => local MCP client usage (Claude Desktop, etc.)
 TRANSPORT = os.getenv("MCP_TRANSPORT", "streamable-http").lower()
 
-
 # -----------------------------
 # Initialize clients
 # -----------------------------
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
-
 
 # -----------------------------
 # Prompt
@@ -198,10 +195,7 @@ async def fetch_and_process_batch() -> None:
 # -----------------------------
 # MCP Server Setup
 # -----------------------------
-async def handle_list_tools(
-    ctx: ServerRequestContext,
-    params: mcp_types.PaginatedRequestParams | None,
-) -> mcp_types.ListToolsResult:
+async def handle_list_tools(ctx, params):
     return mcp_types.ListToolsResult(
         tools=[
             mcp_types.Tool(
@@ -220,10 +214,7 @@ async def handle_list_tools(
     )
 
 
-async def handle_call_tool(
-    ctx: ServerRequestContext,
-    params: mcp_types.CallToolRequestParams,
-) -> mcp_types.CallToolResult:
+async def handle_call_tool(ctx, params):
     if params.name != "process_professional_rewrite":
         raise ValueError(f"Unknown tool: {params.name}")
 
@@ -238,7 +229,6 @@ server = Server(
     on_list_tools=handle_list_tools,
     on_call_tool=handle_call_tool,
 )
-
 
 # -----------------------------
 # Background scheduler
@@ -255,7 +245,6 @@ async def background_worker() -> None:
 def start_background_worker_thread() -> None:
     """
     Run the infinite async background worker in its own daemon thread.
-    This works with both stdio and streamable-http deployments.
     """
     def runner() -> None:
         try:
@@ -271,7 +260,7 @@ def start_background_worker_thread() -> None:
 # Main entry point
 # -----------------------------
 async def run_stdio() -> None:
-    async with mcp.server.stdio.stdio_server() as (read_stream, write_stream):
+    async with stdio_server() as (read_stream, write_stream):
         await server.run(
             read_stream,
             write_stream,
@@ -281,7 +270,6 @@ async def run_stdio() -> None:
 
 def run_streamable_http() -> None:
     import uvicorn
-
     app = server.streamable_http_app()
     uvicorn.run(app, host=HOST, port=PORT)
 
@@ -293,10 +281,9 @@ async def main() -> None:
     print(f"Processing column: {PROCESSED_COLUMN}")
     print(f"Transport: {TRANSPORT}")
 
-    # Start background processor
     start_background_worker_thread()
 
-    if TRANSPORT in {"stdio"}:
+    if TRANSPORT == "stdio":
         await run_stdio()
     else:
         run_streamable_http()
