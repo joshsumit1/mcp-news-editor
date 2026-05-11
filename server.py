@@ -1,40 +1,61 @@
 import asyncio
-import os
 import json
-from datetime import datetime
-from dotenv import load_dotenv
+import os
+import threading
+from datetime import datetime, timezone
+from typing import Any
 
+from dotenv import load_dotenv
 import httpx
 from google import genai
-from google.genai import types
-from supabase import create_client, Client
+from google.genai import types as genai_types
+from supabase import Client, create_client
 
-from mcp.server import Server, NotificationOptions
-from mcp.server.models import InitializationOptions, ServerCapabilities
+from mcp import types as mcp_types
+from mcp.server import Server, ServerRequestContext
 import mcp.server.stdio
-import mcp.types as types_mcp
 
 # Load environment variables from .env file (if present)
 load_dotenv()
 
-# ---------- Configuration with validation ----------
+
+# -----------------------------
+# Configuration
+# -----------------------------
 def get_env_var(name: str) -> str:
     value = os.getenv(name)
     if not value:
         raise RuntimeError(f"Missing required environment variable: {name}")
     return value
 
-API_BASE = get_env_var("API_BASE_URL")                # Your backend on Render
+
+API_BASE = get_env_var("API_BASE_URL")  # Your backend on Render
 SUPABASE_URL = get_env_var("SUPABASE_URL")
 SUPABASE_KEY = get_env_var("SUPABASE_SERVICE_ROLE_KEY")
 GEMINI_API_KEY = get_env_var("GEMINI_API_KEY")
+
 PROCESSED_COLUMN = os.getenv("PROCESSED_COLUMN", "professional_rewrite")
 
+# Railway usually provides PORT. Default to 8000 locally.
+PORT = int(os.getenv("PORT", "8000"))
+HOST = os.getenv("HOST", "0.0.0.0")
+
+# Transport:
+# - streamable-http => best for Railway / remote deployment
+# - stdio => local MCP client usage (Claude Desktop, etc.)
+TRANSPORT = os.getenv("MCP_TRANSPORT", "streamable-http").lower()
+
+
+# -----------------------------
 # Initialize clients
+# -----------------------------
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
-# ---------- Professional News Editor Prompt ----------
+
+# -----------------------------
+# Prompt
+# -----------------------------
 EDITOR_PROMPT_TEMPLATE = """You are a senior news editor at a major international publication.
 Rewrite the following article in a clear, authoritative, and engaging journalistic style.
 Follow these rules strictly:
@@ -53,36 +74,40 @@ Title: {title}
 Content: {content}
 """
 
-# ---------- Helper: Fetch articles without professional rewrite ----------
-async def fetch_articles_to_process(limit: int = 3):
+
+# -----------------------------
+# Helpers
+# -----------------------------
+async def fetch_articles_to_process(limit: int = 3) -> list[dict[str, Any]]:
     """
     Fetch articles that still have NULL in professional_rewrite column.
-    Direct Supabase query is most reliable.
     """
     try:
-        result = supabase.table("ai_news")\
-            .select("id, title, ai_content, short_desc")\
-            .is_(PROCESSED_COLUMN, "null")\
-            .limit(limit)\
+        result = (
+            supabase.table("ai_news")
+            .select("id, title, ai_content, short_desc")
+            .is_(PROCESSED_COLUMN, "null")
+            .limit(limit)
             .execute()
-        articles = result.data
+        )
+        articles = result.data or []
         if articles:
             print(f"📥 Fetched {len(articles)} articles from Supabase")
             return articles
     except Exception as e:
         print(f"❌ Supabase query failed: {e}")
 
-    # Fallback: try your API endpoint (optional, if you added the param)
+    # Fallback: API endpoint
     try:
         async with httpx.AsyncClient() as client:
             resp = await client.get(
                 f"{API_BASE}/api/news",
                 params={"limit": limit, "no_professional": "true"},
-                timeout=10.0
+                timeout=10.0,
             )
         if resp.status_code == 200:
             data = resp.json()
-            articles = data.get("data", [])
+            articles = data.get("data", []) or []
             print(f"📥 Fetched {len(articles)} articles via API fallback")
             return articles
     except Exception as e:
@@ -90,27 +115,30 @@ async def fetch_articles_to_process(limit: int = 3):
 
     return []
 
-# ---------- Core rewriting using Google GenAI SDK (new) ----------
-async def rewrite_professionally(title: str, original_content: str) -> dict:
-    """Send prompt to Gemini and parse JSON response."""
+
+async def rewrite_professionally(title: str, original_content: str) -> dict[str, str]:
+    """
+    Send prompt to Gemini and parse JSON response.
+    """
     prompt = EDITOR_PROMPT_TEMPLATE.format(title=title, content=original_content)
 
-    # Use the async method from google-genai
     response = await gemini_client.aio.models.generate_content(
-        model="gemini-2.0-flash-exp",   # fast, cheap, good for this task
+        model="gemini-2.0-flash-exp",
         contents=prompt,
-        config=types.GenerateContentConfig(
+        config=genai_types.GenerateContentConfig(
             temperature=0.6,
-            response_mime_type="application/json"
-        )
+            response_mime_type="application/json",
+        ),
     )
 
-    raw_text = response.text.strip()
+    raw_text = (response.text or "").strip()
+
     # Extract JSON if Gemini wrapped it in markdown
     if "```json" in raw_text:
-        raw_text = raw_text.split("```json")[1].split("```")[0]
+        raw_text = raw_text.split("```json", 1)[1].split("```", 1)[0]
     elif "```" in raw_text:
-        raw_text = raw_text.split("```")[1].split("```")[0]
+        raw_text = raw_text.split("```", 1)[1].split("```", 1)[0]
+
     raw_text = raw_text.strip()
 
     try:
@@ -120,15 +148,19 @@ async def rewrite_professionally(title: str, original_content: str) -> dict:
         parsed = {"headline": title, "body": raw_text}
 
     return {
-        "headline": parsed.get("headline", title),
-        "body": parsed.get("body", original_content)
+        "headline": str(parsed.get("headline", title)),
+        "body": str(parsed.get("body", original_content)),
     }
 
-async def process_article(article: dict):
-    """Rewrite one article and update Supabase."""
+
+async def process_article(article: dict[str, Any]) -> None:
+    """
+    Rewrite one article and update Supabase.
+    """
     article_id = article["id"]
     original_title = article.get("title", "")
     base_content = article.get("ai_content") or article.get("short_desc") or ""
+
     if not base_content:
         print(f"⚠️ Article {article_id} has no content, skipping")
         return
@@ -137,76 +169,138 @@ async def process_article(article: dict):
         rewritten = await rewrite_professionally(original_title, base_content)
         full_text = f"{rewritten['headline']}\n\n{rewritten['body']}"
 
-        supabase.table("ai_news")\
-            .update({
+        supabase.table("ai_news").update(
+            {
                 PROCESSED_COLUMN: full_text,
-                "professional_rewrite_at": datetime.utcnow().isoformat()
-            })\
-            .eq("id", article_id)\
-            .execute()
+                "professional_rewrite_at": datetime.now(timezone.utc).isoformat(),
+            }
+        ).eq("id", article_id).execute()
+
         print(f"✅ Article {article_id} rewritten professionally")
     except Exception as e:
         print(f"❌ Error rewriting article {article_id}: {e}")
 
-async def fetch_and_process_batch():
-    """Main batch function: get up to 3 unprocessed articles, rewrite, update DB."""
+
+async def fetch_and_process_batch() -> None:
+    """
+    Main batch function: get up to 3 unprocessed articles, rewrite, update DB.
+    """
     articles = await fetch_articles_to_process(limit=3)
     if not articles:
-        print(f"[{datetime.utcnow().isoformat()}] No pending articles. Sleeping...")
+        print(f"[{datetime.now(timezone.utc).isoformat()}] No pending articles.")
         return
+
     print(f"Processing {len(articles)} article(s)...")
     for art in articles:
         await process_article(art)
 
-# ---------- MCP Server Setup ----------
-server = Server("professional-news-editor")
 
-@server.list_tools()
-async def handle_list_tools() -> list[types_mcp.Tool]:
-    return [
-        types_mcp.Tool(
-            name="process_professional_rewrite",
-            description="Fetch up to 3 articles without professional rewrite, rewrite them with Gemini, and store the result.",
-            inputSchema={"type": "object", "properties": {}, "required": []}
-        )
-    ]
+# -----------------------------
+# MCP Server Setup
+# -----------------------------
+async def handle_list_tools(
+    ctx: ServerRequestContext,
+    params: mcp_types.PaginatedRequestParams | None,
+) -> mcp_types.ListToolsResult:
+    return mcp_types.ListToolsResult(
+        tools=[
+            mcp_types.Tool(
+                name="process_professional_rewrite",
+                description=(
+                    "Fetch up to 3 articles without professional rewrite, "
+                    "rewrite them with Gemini, and store the result."
+                ),
+                input_schema={
+                    "type": "object",
+                    "properties": {},
+                    "required": [],
+                },
+            )
+        ]
+    )
 
-@server.call_tool()
-async def handle_call_tool(name: str, arguments: dict) -> list[types_mcp.TextContent]:
-    if name == "process_professional_rewrite":
-        await fetch_and_process_batch()
-        return [types_mcp.TextContent(type="text", text="Batch processed.")]
-    else:
-        raise ValueError(f"Unknown tool: {name}")
 
-# ---------- Background scheduler (runs every 60 seconds) ----------
-async def background_worker():
+async def handle_call_tool(
+    ctx: ServerRequestContext,
+    params: mcp_types.CallToolRequestParams,
+) -> mcp_types.CallToolResult:
+    if params.name != "process_professional_rewrite":
+        raise ValueError(f"Unknown tool: {params.name}")
+
+    await fetch_and_process_batch()
+    return mcp_types.CallToolResult(
+        content=[mcp_types.TextContent(type="text", text="Batch processed.")]
+    )
+
+
+server = Server(
+    "professional-news-editor",
+    on_list_tools=handle_list_tools,
+    on_call_tool=handle_call_tool,
+)
+
+
+# -----------------------------
+# Background scheduler
+# -----------------------------
+async def background_worker() -> None:
     while True:
-        await fetch_and_process_batch()
-        await asyncio.sleep(60)   # exactly 1 minute
+        try:
+            await fetch_and_process_batch()
+        except Exception as e:
+            print(f"❌ Background worker error: {e}")
+        await asyncio.sleep(60)
 
-# ---------- Main entry point ----------
-async def main():
-    print("🚀 Starting Professional News Editor MCP Server")
-    print(f"Supabase URL: {SUPABASE_URL[:20]}...")
-    print(f"Gemini API Key: {'Set' if GEMINI_API_KEY else 'Missing'}")
-    print(f"Processing column: {PROCESSED_COLUMN}")
 
-    # Start background worker as a separate task
-    asyncio.create_task(background_worker())
+def start_background_worker_thread() -> None:
+    """
+    Run the infinite async background worker in its own daemon thread.
+    This works with both stdio and streamable-http deployments.
+    """
+    def runner() -> None:
+        try:
+            asyncio.run(background_worker())
+        except Exception as e:
+            print(f"❌ Background worker thread stopped: {e}")
 
-    # Run MCP stdio server (for manual tools via Claude Desktop etc.)
+    thread = threading.Thread(target=runner, daemon=True)
+    thread.start()
+
+
+# -----------------------------
+# Main entry point
+# -----------------------------
+async def run_stdio() -> None:
     async with mcp.server.stdio.stdio_server() as (read_stream, write_stream):
         await server.run(
             read_stream,
             write_stream,
-            InitializationOptions(
-                server_name="professional-news-editor",
-                server_version="1.0.0",
-                capabilities=ServerCapabilities(tools=True)   # Required field
-            ),
-            notification_options=NotificationOptions(tools_changed=True)
+            server.create_initialization_options(),
         )
+
+
+def run_streamable_http() -> None:
+    import uvicorn
+
+    app = server.streamable_http_app()
+    uvicorn.run(app, host=HOST, port=PORT)
+
+
+async def main() -> None:
+    print("🚀 Starting Professional News Editor MCP Server")
+    print(f"Supabase URL: {SUPABASE_URL[:20]}...")
+    print(f"Gemini API Key: {'Set' if GEMINI_API_KEY else 'Missing'}")
+    print(f"Processing column: {PROCESSED_COLUMN}")
+    print(f"Transport: {TRANSPORT}")
+
+    # Start background processor
+    start_background_worker_thread()
+
+    if TRANSPORT in {"stdio"}:
+        await run_stdio()
+    else:
+        run_streamable_http()
+
 
 if __name__ == "__main__":
     asyncio.run(main())
