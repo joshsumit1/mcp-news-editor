@@ -12,7 +12,6 @@ from google.genai import types as genai_types
 from supabase import Client, create_client
 
 from mcp.server.fastmcp import Context, FastMCP
-from mcp.server.session import ServerSession
 
 # Load environment variables from .env file (if present)
 load_dotenv()
@@ -27,20 +26,16 @@ def get_env_var(name: str) -> str:
     return value
 
 
-API_BASE = get_env_var("API_BASE_URL")  # Your backend on Render
+API_BASE = get_env_var("API_BASE_URL")
 SUPABASE_URL = get_env_var("SUPABASE_URL")
 SUPABASE_KEY = get_env_var("SUPABASE_SERVICE_ROLE_KEY")
 GEMINI_API_KEY = get_env_var("GEMINI_API_KEY")
 
 PROCESSED_COLUMN = os.getenv("PROCESSED_COLUMN", "professional_rewrite")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash-001")
 
-# Railway usually provides PORT. Default to 8000 locally.
-PORT = int(os.getenv("PORT", "8000"))
+PORT = int(os.getenv("PORT", "8080"))
 HOST = os.getenv("HOST", "0.0.0.0")
-
-# Transport:
-# - streamable-http => best for Railway / remote deployment
-# - stdio => local MCP client usage
 TRANSPORT = os.getenv("MCP_TRANSPORT", "streamable-http").lower()
 
 # -----------------------------
@@ -58,7 +53,6 @@ mcp = FastMCP(
     json_response=True,
 )
 
-# Set host/port if supported by the installed SDK
 try:
     mcp.settings.host = HOST
     mcp.settings.port = PORT
@@ -85,6 +79,7 @@ Original article:
 Title: {title}
 Content: {content}
 """
+
 
 # -----------------------------
 # Helpers
@@ -127,22 +122,47 @@ async def fetch_articles_to_process(limit: int = 3) -> list[dict[str, Any]]:
     return []
 
 
-async def rewrite_professionally(title: str, original_content: str) -> dict[str, str]:
-    """
-    Send prompt to Gemini and parse JSON response.
-    """
-    prompt = EDITOR_PROMPT_TEMPLATE.format(title=title, content=original_content)
-
+async def _call_gemini(prompt: str, model_name: str) -> str:
     response = await gemini_client.aio.models.generate_content(
-        model="gemini-2.0-flash-exp",
+        model=model_name,
         contents=prompt,
         config=genai_types.GenerateContentConfig(
             temperature=0.6,
             response_mime_type="application/json",
         ),
     )
+    return (response.text or "").strip()
 
-    raw_text = (response.text or "").strip()
+
+async def rewrite_professionally(title: str, original_content: str) -> dict[str, str]:
+    """
+    Send prompt to Gemini and parse JSON response.
+    Tries the configured model first, then safe fallbacks.
+    """
+    prompt = EDITOR_PROMPT_TEMPLATE.format(title=title, content=original_content)
+
+    candidate_models = [
+        GEMINI_MODEL,
+        "gemini-2.0-flash-001",
+        "gemini-2.5-flash",
+        "gemini-1.5-flash",
+    ]
+
+    last_error = None
+    raw_text = ""
+
+    for model_name in dict.fromkeys(candidate_models):  # remove duplicates, preserve order
+        try:
+            raw_text = await _call_gemini(prompt, model_name)
+            if raw_text:
+                print(f"✅ Gemini response received using model: {model_name}")
+                break
+        except Exception as e:
+            last_error = e
+            print(f"⚠️ Gemini model failed ({model_name}): {e}")
+            continue
+    else:
+        raise RuntimeError(f"All Gemini model attempts failed: {last_error}")
 
     # Extract JSON if Gemini wrapped it in markdown
     if "```json" in raw_text:
@@ -210,16 +230,23 @@ async def fetch_and_process_batch() -> None:
 # Tool exposed to MCP clients
 # -----------------------------
 @mcp.tool()
-async def process_professional_rewrite(
-    ctx: Context[ServerSession, None],
-) -> str:
+async def process_professional_rewrite(ctx: Context) -> str:
     """
     Fetch up to 3 articles without professional rewrite, rewrite them with Gemini,
     and store the result.
     """
-    await ctx.info("Starting professional rewrite batch...")
+    try:
+        await ctx.info("Starting professional rewrite batch...")
+    except Exception:
+        pass
+
     await fetch_and_process_batch()
-    await ctx.info("Professional rewrite batch completed.")
+
+    try:
+        await ctx.info("Professional rewrite batch completed.")
+    except Exception:
+        pass
+
     return "Batch processed."
 
 
@@ -257,6 +284,7 @@ def main() -> None:
     print(f"Supabase URL: {SUPABASE_URL[:20]}...")
     print(f"Gemini API Key: {'Set' if GEMINI_API_KEY else 'Missing'}")
     print(f"Processing column: {PROCESSED_COLUMN}")
+    print(f"Gemini model: {GEMINI_MODEL}")
     print(f"Transport: {TRANSPORT}")
     print(f"Host: {HOST}")
     print(f"Port: {PORT}")
