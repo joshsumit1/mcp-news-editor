@@ -11,9 +11,8 @@ from google import genai
 from google.genai import types as genai_types
 from supabase import Client, create_client
 
-from mcp import types as mcp_types
-from mcp.server import Server
-from mcp.server.stdio import stdio_server
+from mcp.server.fastmcp import Context, FastMCP
+from mcp.server.session import ServerSession
 
 # Load environment variables from .env file (if present)
 load_dotenv()
@@ -41,7 +40,7 @@ HOST = os.getenv("HOST", "0.0.0.0")
 
 # Transport:
 # - streamable-http => best for Railway / remote deployment
-# - stdio => local MCP client usage (Claude Desktop, etc.)
+# - stdio => local MCP client usage
 TRANSPORT = os.getenv("MCP_TRANSPORT", "streamable-http").lower()
 
 # -----------------------------
@@ -49,6 +48,22 @@ TRANSPORT = os.getenv("MCP_TRANSPORT", "streamable-http").lower()
 # -----------------------------
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+
+# -----------------------------
+# MCP Server
+# -----------------------------
+mcp = FastMCP(
+    "professional-news-editor",
+    stateless_http=True,
+    json_response=True,
+)
+
+# Set host/port if supported by the installed SDK
+try:
+    mcp.settings.host = HOST
+    mcp.settings.port = PORT
+except Exception:
+    pass
 
 # -----------------------------
 # Prompt
@@ -70,7 +85,6 @@ Original article:
 Title: {title}
 Content: {content}
 """
-
 
 # -----------------------------
 # Helpers
@@ -193,42 +207,21 @@ async def fetch_and_process_batch() -> None:
 
 
 # -----------------------------
-# MCP Server Setup
+# Tool exposed to MCP clients
 # -----------------------------
-async def handle_list_tools(ctx, params):
-    return mcp_types.ListToolsResult(
-        tools=[
-            mcp_types.Tool(
-                name="process_professional_rewrite",
-                description=(
-                    "Fetch up to 3 articles without professional rewrite, "
-                    "rewrite them with Gemini, and store the result."
-                ),
-                input_schema={
-                    "type": "object",
-                    "properties": {},
-                    "required": [],
-                },
-            )
-        ]
-    )
-
-
-async def handle_call_tool(ctx, params):
-    if params.name != "process_professional_rewrite":
-        raise ValueError(f"Unknown tool: {params.name}")
-
+@mcp.tool()
+async def process_professional_rewrite(
+    ctx: Context[ServerSession, None],
+) -> str:
+    """
+    Fetch up to 3 articles without professional rewrite, rewrite them with Gemini,
+    and store the result.
+    """
+    await ctx.info("Starting professional rewrite batch...")
     await fetch_and_process_batch()
-    return mcp_types.CallToolResult(
-        content=[mcp_types.TextContent(type="text", text="Batch processed.")]
-    )
+    await ctx.info("Professional rewrite batch completed.")
+    return "Batch processed."
 
-
-server = Server(
-    "professional-news-editor",
-    on_list_tools=handle_list_tools,
-    on_call_tool=handle_call_tool,
-)
 
 # -----------------------------
 # Background scheduler
@@ -259,35 +252,22 @@ def start_background_worker_thread() -> None:
 # -----------------------------
 # Main entry point
 # -----------------------------
-async def run_stdio() -> None:
-    async with stdio_server() as (read_stream, write_stream):
-        await server.run(
-            read_stream,
-            write_stream,
-            server.create_initialization_options(),
-        )
-
-
-def run_streamable_http() -> None:
-    import uvicorn
-    app = server.streamable_http_app()
-    uvicorn.run(app, host=HOST, port=PORT)
-
-
-async def main() -> None:
+def main() -> None:
     print("🚀 Starting Professional News Editor MCP Server")
     print(f"Supabase URL: {SUPABASE_URL[:20]}...")
     print(f"Gemini API Key: {'Set' if GEMINI_API_KEY else 'Missing'}")
     print(f"Processing column: {PROCESSED_COLUMN}")
     print(f"Transport: {TRANSPORT}")
+    print(f"Host: {HOST}")
+    print(f"Port: {PORT}")
 
     start_background_worker_thread()
 
     if TRANSPORT == "stdio":
-        await run_stdio()
+        mcp.run()
     else:
-        run_streamable_http()
+        mcp.run(transport="streamable-http")
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
