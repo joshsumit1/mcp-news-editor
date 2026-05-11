@@ -203,7 +203,7 @@ async def process_article(article: dict[str, Any]) -> None:
         supabase.table("ai_news").update(
             {
                 PROCESSED_COLUMN: full_text,
-                "professional_rewrite_at": datetime.now(timezone.utc).isoformat(),
+                "professional_rewrite": datetime.now(timezone.utc).isoformat(),
             }
         ).eq("id", article_id).execute()
 
